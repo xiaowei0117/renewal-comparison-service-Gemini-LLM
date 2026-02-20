@@ -11,6 +11,12 @@ import asyncio
 from typing import Dict, List, Optional
 import httpx
 
+# Explicitly set tesseract path for Windows
+if os.name == "nt":
+    tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
 app = FastAPI()
 
 # Environment variables
@@ -34,20 +40,54 @@ COVERAGE_TEMPLATES = {
         {"key": "deductible", "label": "Deductible", "regex": r"deductible"},
     ],
     "dwelling_fire": [
-        {"key": "coverage_a", "label": "Coverage A (Dwelling)", "regex": r"coverage\s*a\b|dwelling\b"},
-        {"key": "coverage_c", "label": "Coverage C (Personal Property)", "regex": r"coverage\s*c\b|personal property"},
-        {"key": "deductible", "label": "Deductible", "regex": r"deductible"},
+        # Coverage A: "A. DWELLING $ 308,386" — value on same line
+        {"key": "coverage_a", "label": "Coverage A (Dwelling)", "regex": r"a\.\s*dwelling|^dwelling\s+\$"},
+        # Other Structures: label on one line, "Limit: $30,839" on next line
+        {"key": "other_structures", "label": "Other Structures", "regex": r"other structures", "next_line": True},
+        # Personal Liability: "C. PERSONAL LIABILITY – EACH OCCURRENCE $ 500,000"
+        {"key": "liability", "label": "Personal Liability", "regex": r"c\.\s*personal liability|personal liability.*occurrence"},
+        # Medical Payments: "D. MEDICAL PAYMENTS TO OTHERS $ 5,000"
+        {"key": "medical", "label": "Medical Payments", "regex": r"d\.\s*medical payments|medical payments to others"},
+        # Fair Rental Value: label on one line, "Limit: $61,678" on next line
+        {"key": "fair_rental", "label": "Fair Rental Value", "regex": r"fair rental value", "next_line": True},
+        # Deductible: appears as "$ 3,084 which applies to all perils" (standalone line)
+        {"key": "deductible", "label": "Deductible", "regex": r"^\$\s*[\d,]+\s+which applies"},
     ],
 }
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from PDF using PyPDF2."""
-    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() or ""
-    return text
+    """Extract text from PDF using PyPDF2, with OCR fallback for scanned PDFs."""
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() or ""
+
+        # Check if extraction looks valid (not garbled)
+        # Garbled PDFs often have patterns like /i255 /1 /2 /3
+        sample = text[:500]
+        slash_count = sample.count('/')
+        token_pattern_count = len(re.findall(r'/\w+\s+/\w+', sample))
+
+        # Consider it garbled if:
+        # 1. Too many slashes (> 20% of characters)
+        # 2. Has PDF token patterns like "/i255 /1"
+        # 3. Very short text
+        is_garbled = (
+            slash_count > len(sample) * 0.2 or
+            token_pattern_count > 5 or
+            len(text.strip()) < 100
+        )
+
+        if is_garbled:
+            print(f"[extract_text_from_pdf] Text extraction looks garbled (slashes={slash_count}, tokens={token_pattern_count}, len={len(text)}), falling back to OCR")
+            return ""  # Return empty to trigger OCR fallback in caller
+
+        return text
+    except Exception as e:
+        print(f"[extract_text_from_pdf] PyPDF2 failed: {e}")
+        return ""
 
 
 def extract_text_from_image(file_bytes: bytes) -> str:
@@ -59,10 +99,11 @@ def extract_text_from_image(file_bytes: bytes) -> str:
 def detect_doc_type(text: str) -> str:
     """Detect document type from text content."""
     normalized = text.lower()
-    if re.search(r"homeowners|homeowner|ho-?3|coverage a|coverage b", normalized):
-        return "homeowners"
+    # Check dwelling fire FIRST — these also contain "coverage a" so must be checked before homeowners
     if re.search(r"dwelling fire|dp-?3|dp-?1", normalized):
         return "dwelling_fire"
+    if re.search(r"homeowners|homeowner|ho-?3", normalized):
+        return "homeowners"
     if re.search(r"bodily injury|property damage|vehicle|auto policy|collision", normalized):
         return "auto"
     return "unknown"
@@ -90,26 +131,54 @@ def pick_coverage_value(line: str) -> str:
 def parse_premium(text: str) -> Optional[float]:
     """Extract premium amount from text."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    premium_lines = [l for l in lines if re.search(r"premium", l, re.I)]
-    numbers = []
-    for line in premium_lines:
-        tokens = extract_numeric_tokens(line)
-        for token in tokens:
-            value = float(token.replace("$", "").replace(",", ""))
-            numbers.append(value)
-    return max(numbers) if numbers else None
+
+    # Priority 1: look for "total premium" or "annual premium" lines
+    for line in lines:
+        if re.search(r"total\s+premium|annual\s+premium", line, re.I):
+            tokens = extract_numeric_tokens(line)
+            for token in tokens:
+                value = float(token.replace("$", "").replace(",", ""))
+                if 100 < value < 100000:  # sanity check: plausible premium range
+                    return value
+
+    # Priority 2: look for a standalone premium line (not "at no additional premium", "your premium", etc.)
+    for line in lines:
+        if re.search(r"^\s*(basic\s+)?premium\s*[\$\d]", line, re.I):
+            tokens = extract_numeric_tokens(line)
+            for token in tokens:
+                value = float(token.replace("$", "").replace(",", ""))
+                if 100 < value < 100000:
+                    return value
+
+    return None
+
+
+def is_toc_line(line: str) -> bool:
+    """Return True if line looks like a table of contents entry (e.g. 'Coverage B .... 2')."""
+    return len(re.findall(r'\.{3,}', line)) > 0
 
 
 def parse_coverages(text: str, doc_type: str) -> Dict[str, str]:
     """Extract coverage values based on document type."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
+    # Remove table of contents lines
+    lines = [l for l in lines if not is_toc_line(l)]
+
     coverages = {}
     patterns = COVERAGE_TEMPLATES.get(doc_type, [])
-    for line in lines:
+
+    for i, line in enumerate(lines):
         for pattern in patterns:
+            if pattern["label"] in coverages:
+                continue  # already found
             if re.search(pattern["regex"], line, re.I):
-                value = pick_coverage_value(line)
-                if value and pattern["label"] not in coverages:
+                if pattern.get("next_line"):
+                    # Value is on the next non-empty line
+                    next_line = lines[i + 1] if i + 1 < len(lines) else ""
+                    value = pick_coverage_value(next_line)
+                else:
+                    value = pick_coverage_value(line)
+                if value:
                     coverages[pattern["label"]] = value
     return coverages
 
@@ -206,6 +275,25 @@ async def extract(file: UploadFile = File(...)):
     # Determine file type and extract text
     if filename.lower().endswith(".pdf") or file.content_type == "application/pdf":
         text = extract_text_from_pdf(file_bytes)
+        # If PDF extraction failed/garbled, try OCR as fallback
+        if not text or len(text.strip()) < 100:
+            print("[extract] PDF text extraction failed/garbled, trying OCR on PDF pages")
+            try:
+                import pymupdf
+                pdf_doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+                text = ""
+                # OCR first 3 pages
+                num_pages = min(3, len(pdf_doc))
+                for page_num in range(num_pages):
+                    page = pdf_doc[page_num]
+                    # Render page to image (at 2x resolution for better OCR)
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    text += pytesseract.image_to_string(img) + "\n"
+                pdf_doc.close()
+                print(f"[extract] OCR extracted {len(text)} characters from {num_pages} PDF pages")
+            except Exception as e:
+                print(f"[extract] OCR fallback failed: {e}")
     elif file.content_type and file.content_type.startswith("image/"):
         text = extract_text_from_image(file_bytes)
     else:
