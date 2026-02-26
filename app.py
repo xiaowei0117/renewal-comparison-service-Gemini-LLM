@@ -10,6 +10,11 @@ import json
 import asyncio
 from typing import Dict, List, Optional
 import httpx
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load .env from the same directory as this script, regardless of where uvicorn is launched from
+load_dotenv(Path(__file__).parent / ".env")
 
 # Explicitly set tesseract path for Windows
 if os.name == "nt":
@@ -22,6 +27,7 @@ app = FastAPI()
 # Environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+print(f"[startup] GEMINI_API_KEY loaded: {'YES' if GEMINI_API_KEY else 'NO (AI analysis will be disabled)'}")
 
 COVERAGE_TEMPLATES = {
     "auto": [
@@ -50,8 +56,14 @@ COVERAGE_TEMPLATES = {
         {"key": "medical", "label": "Medical Payments", "regex": r"d\.\s*medical payments|medical payments to others"},
         # Fair Rental Value: label on one line, "Limit: $61,678" on next line
         {"key": "fair_rental", "label": "Fair Rental Value", "regex": r"fair rental value", "next_line": True},
-        # Deductible: appears as "$ 3,084 which applies to all perils" (standalone line)
-        {"key": "deductible", "label": "Deductible", "regex": r"^\$\s*[\d,]+\s+which applies"},
+        # Deductible (All Perils): "$ 3,084 which applies to all perils"
+        {"key": "deductible_all", "label": "Deductible (All Perils)", "regex": r"^\$\s*[\d,]+\s+which applies"},
+        # Deductible (Wind/Hail): "Your Percentage Deductible of $3,084 (1% of your Coverage A amount)"
+        {"key": "deductible_wind", "label": "Deductible (Wind/Hail)", "regex": r"your percentage deductible of", "wind_deductible": True},
+        # Vandalism & Malicious Mischief: no dollar amount — mark as Included
+        {"key": "vandalism", "label": "Vandalism & Malicious Mischief", "regex": r"vandalism and malicious mischief", "presence_only": True},
+        # Water Backup: no dollar amount — mark as Included
+        {"key": "water_backup", "label": "Water Backup", "regex": r"water backup", "presence_only": True},
     ],
 }
 
@@ -129,19 +141,28 @@ def pick_coverage_value(line: str) -> str:
 
 
 def parse_premium(text: str) -> Optional[float]:
-    """Extract premium amount from text."""
+    """Extract total amount (premium + policy fee) from text."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    # Priority 1: look for "total premium" or "annual premium" lines
+    # Priority 1: standalone "TOTAL $ 1,075" line (includes policy fee)
+    for line in lines:
+        if re.search(r"^\s*total\s+[\$s]", line, re.I) and not re.search(r"premium|liability|other|property|loss", line, re.I):
+            tokens = extract_numeric_tokens(line)
+            for token in tokens:
+                value = float(token.replace("$", "").replace(",", ""))
+                if 100 < value < 100000:
+                    return value
+
+    # Priority 2: "TOTAL PREMIUM" line
     for line in lines:
         if re.search(r"total\s+premium|annual\s+premium", line, re.I):
             tokens = extract_numeric_tokens(line)
             for token in tokens:
                 value = float(token.replace("$", "").replace(",", ""))
-                if 100 < value < 100000:  # sanity check: plausible premium range
+                if 100 < value < 100000:
                     return value
 
-    # Priority 2: look for a standalone premium line (not "at no additional premium", "your premium", etc.)
+    # Priority 3: standalone "BASIC PREMIUM" line
     for line in lines:
         if re.search(r"^\s*(basic\s+)?premium\s*[\$\d]", line, re.I):
             tokens = extract_numeric_tokens(line)
@@ -172,46 +193,64 @@ def parse_coverages(text: str, doc_type: str) -> Dict[str, str]:
             if pattern["label"] in coverages:
                 continue  # already found
             if re.search(pattern["regex"], line, re.I):
-                if pattern.get("next_line"):
-                    # Value is on the next non-empty line
+                if pattern.get("presence_only"):
+                    # No dollar amount — just mark as included
+                    coverages[pattern["label"]] = "Included"
+                elif pattern.get("wind_deductible"):
+                    # Extract "1% ($3,084)" from "Your Percentage Deductible of $3,084 (1% of your Coverage A amount)"
+                    pct_match = re.search(r"(\d+\.?\d*)\s*%", line)
+                    dollar_match = re.search(r"\$([\d,]+)", line)
+                    if pct_match and dollar_match:
+                        coverages[pattern["label"]] = f"{pct_match.group(1)}% (${dollar_match.group(1)})"
+                    elif dollar_match:
+                        coverages[pattern["label"]] = f"${dollar_match.group(1)}"
+                elif pattern.get("next_line"):
                     next_line = lines[i + 1] if i + 1 < len(lines) else ""
                     value = pick_coverage_value(next_line)
+                    if value:
+                        coverages[pattern["label"]] = value
                 else:
                     value = pick_coverage_value(line)
-                if value:
-                    coverages[pattern["label"]] = value
+                    if value:
+                        coverages[pattern["label"]] = value
     return coverages
 
 
 async def call_gemini(prompt: str) -> str:
-    """Call Gemini API for LLM-based extraction."""
+    """Call Gemini API for LLM analysis."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+    }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
-            },
-        )
+    for attempt in range(3):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, json=payload)
 
         if response.status_code == 429:
-            # Rate limit - wait and retry once
-            await asyncio.sleep(5)
-            response = await client.post(url, json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
-            })
+            wait = (attempt + 1) * 10  # 10s, 20s, 30s
+            print(f"[gemini] Rate limited (429), waiting {wait}s before retry {attempt + 1}/3")
+            await asyncio.sleep(wait)
+            continue
 
         if not response.is_success:
-            raise ValueError(f"Gemini API error: {response.status_code} {response.text[:200]}")
+            raise ValueError(f"Gemini API error: {response.status_code} {response.text[:300]}")
 
         data = response.json()
-        return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        candidates = data.get("candidates", [])
+        if not candidates:
+            # Gemini returned empty candidates (transient overload or safety block) — retry
+            block_reason = data.get("promptFeedback", {}).get("blockReason", "unknown")
+            print(f"[gemini] Empty candidates on attempt {attempt + 1}, blockReason={block_reason}, retrying...")
+            await asyncio.sleep((attempt + 1) * 5)
+            continue
+        return candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+
+    raise ValueError("Gemini API returned empty candidates after 3 attempts")
 
 
 async def llm_extract_policy_data(text: str) -> tuple[Optional[float], str, Dict[str, str]]:
@@ -299,24 +338,8 @@ async def extract(file: UploadFile = File(...)):
     else:
         text = ""
 
-    # Try LLM-based extraction first if API key is available
-    if GEMINI_API_KEY and text:
-        try:
-            llm_premium, llm_doc_type, llm_coverages = await llm_extract_policy_data(text)
-
-            # Use LLM results if they seem valid
-            if llm_doc_type != "unknown" or llm_premium is not None or llm_coverages:
-                print(f"[extract] Using LLM extraction (doc_type={llm_doc_type}, premium={llm_premium})")
-                return ExtractResponse(
-                    text=text,
-                    premium=llm_premium,
-                    doc_type=llm_doc_type,
-                    coverages=llm_coverages,
-                )
-        except Exception as e:
-            print(f"[extract] LLM extraction failed, falling back to regex: {e}")
-
-    # Fallback to regex-based extraction
+    # Always use regex-based extraction (consistent labels for table display)
+    # LLM is only used in /compare for analysis summary
     print("[extract] Using regex-based extraction")
     doc_type = detect_doc_type(text)
     premium = parse_premium(text)
@@ -367,22 +390,38 @@ async def compare(req: CompareRequest):
         elif before and after and before != after:
             diffs.append(f"{key}: {before} → {after}.")
 
-    # Generate LLM summary if available
+    # Generate LLM analysis if available
     llm_summary = None
     if GEMINI_API_KEY and (premium_diff or diffs):
         try:
-            summary_prompt = f"""You are an insurance agent explaining policy changes to a client. Summarize the following renewal changes in 2-3 clear, conversational sentences.
+            # Build a coverage comparison table for the prompt
+            coverage_lines = []
+            for key in set(req.old_coverages.keys()) | set(req.new_coverages.keys()):
+                old_val = req.old_coverages.get(key, "—")
+                new_val = req.new_coverages.get(key, "—")
+                coverage_lines.append(f"  {key}: {old_val} → {new_val}")
 
-Premium change: {premium_diff or "No change"}
-Coverage changes: {', '.join(diffs) if diffs else "No coverage changes detected"}
+            summary_prompt = f"""You are a senior insurance analyst reviewing a dwelling fire (DP3) policy renewal for an agent.
 
-Write a brief, client-friendly summary focusing on what matters most (premium impact and major coverage changes). Keep it under 100 words."""
+Policy data:
+- Total cost: {f"${req.old_premium:.0f}" if req.old_premium else "N/A"} → {f"${req.new_premium:.0f}" if req.new_premium else "N/A"}
+- Coverage changes:
+{chr(10).join(coverage_lines)}
+
+Provide a structured analysis with these sections:
+1. **Reason for Premium Change**: Identify the primary driver (e.g. inflation guard adjusting Coverage A, pure rate increase, new endorsements). Calculate the % change in Coverage A and compare it to the % change in premium to determine if this is a standard inflation adjustment or a rate increase.
+2. **Key Changes**: Highlight the 2-3 most significant changes the client should know about.
+3. **Agent Recommendation**: One clear action item or talking point for the agent when presenting this renewal to the client.
+
+Use specific dollar amounts. Be concise — total response under 180 words."""
 
             llm_summary = await call_gemini(summary_prompt)
             llm_summary = llm_summary.strip()
             print(f"[compare] Generated LLM summary: {llm_summary[:100]}...")
         except Exception as e:
+            import traceback
             print(f"[compare] LLM summary failed: {e}")
+            print(traceback.format_exc())
 
     return CompareResponse(
         premium_diff=premium_diff,
